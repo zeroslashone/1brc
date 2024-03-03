@@ -21,7 +21,7 @@ func (tc *testCharter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func TestEval(t *testing.T) {
+func TestCompute(t *testing.T) {
 	tc := &testCharter{}
 	tc.input = `Kabala;-10.4
 Khrustalnyi;-6.6
