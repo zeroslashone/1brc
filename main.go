@@ -1,17 +1,17 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"runtime"
 	"runtime/pprof"
 	"slices"
 	"strconv"
-	"strings"
+	"sync"
 )
 
 func main() {
@@ -60,62 +60,144 @@ func main() {
 }
 
 type TemperatureInfo struct {
-	minimum float64
-	maximum float64
-	total   float64
+	minimum int64
+	maximum int64
+	total   int64
 	count   int
 }
 
 func compute(r io.Reader, w io.Writer) {
-	s := bufio.NewScanner(r)
-	res := []byte{}
-	temperatures := map[string]*TemperatureInfo{}
-	for s.Scan() {
-		datum := strings.Split(s.Text(), ";")
-		town := datum[0]
-		temp, _ := strconv.ParseFloat(datum[1], 64)
+	var res bytes.Buffer
+	temperatures := aggregateTemperatures(processChunk(processFile(r)))
 
-		if _, ok := temperatures[town]; !ok {
-			temperatures[town] = &TemperatureInfo{
-				minimum: 100.0,
-				maximum: -100.0,
-				total:   0.0,
-				count:   0,
-			}
-		}
-		townTempInfo := temperatures[town]
-		townTempInfo.minimum = min(townTempInfo.minimum, temp)
-		townTempInfo.maximum = max(townTempInfo.maximum, temp)
-		townTempInfo.total += temp
-		townTempInfo.count++
-	}
 	towns := make([]string, 0, len(temperatures))
 	for k := range temperatures {
 		towns = append(towns, k)
 	}
 	slices.Sort(towns)
 
+	res.WriteRune('{')
 	for i, town := range towns {
-		if i == 0 {
-			res = append(res, byte('{'))
-		} else if i < len(towns) {
-			res = append(res, []byte(", ")...)
+		res.WriteString(fmt.Sprintf(
+			"%v=%.1f/%.1f/%.1f",
+			town,
+			float64(temperatures[town].minimum)/10.0,
+			float64(temperatures[town].maximum)/10.0,
+			(float64(temperatures[town].total)/10.0)/float64(temperatures[town].count),
+		))
+		if i < len(towns)-1 {
+			res.WriteString(", ")
 		}
+	}
+	res.WriteRune('}')
+	w.Write(res.Bytes())
+}
 
-		res = append(
-			res,
-			[]byte(fmt.Sprintf(
-				"%v=%.1f/%.1f/%.1f",
-				town,
-				temperatures[town].minimum,
-				temperatures[town].maximum,
-				math.Round((temperatures[town].total/float64(temperatures[town].count))*10)/10,
-			))...,
-		)
-		if i == len(towns)-1 {
-			res = append(res, byte('}'))
+func processFile(r io.Reader) <-chan []byte {
+	chunkStream := make(chan []byte)
+
+	go func() {
+		defer close(chunkStream)
+		chunkSize := 64 * 1024 * 1024
+		data := make([]byte, chunkSize)
+		delim := byte('\n')
+		leftover := 0
+		for {
+			n, err := r.Read(data[leftover:])
+
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				panic(err)
+			}
+
+			dataCopy := data[:leftover+n]
+			lastNewLineIndex := bytes.LastIndexByte(dataCopy, delim)
+			data = make([]byte, chunkSize)
+			leftover = copy(data, dataCopy[lastNewLineIndex+1:])
+			chunkStream <- dataCopy[:lastNewLineIndex]
+		}
+	}()
+
+	return chunkStream
+}
+
+func processChunk(chunkStream <-chan []byte) <-chan map[string]*TemperatureInfo {
+	tempInfoStream := make(chan map[string]*TemperatureInfo, 100)
+	var wg sync.WaitGroup
+
+	go func() {
+		defer close(tempInfoStream)
+		defer wg.Wait()
+
+		for range runtime.NumCPU() {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+				for chunk := range chunkStream {
+					chunk := string(chunk)
+					temperatures := map[string]*TemperatureInfo{}
+					start := 0
+					lastSemiColon := 0
+					var base, fract, temp int64
+					var town string
+
+					for i, c := range chunk {
+						switch c {
+						case ';':
+							town = chunk[start:i]
+							lastSemiColon = i
+							continue
+						case '\n':
+							start = i + 1
+						default:
+							continue
+						}
+
+						base, _ = strconv.ParseInt(chunk[lastSemiColon+1:i-2], 0, 64)
+						fract, _ = strconv.ParseInt(chunk[i-1:i], 0, 64)
+						temp = base*10 + fract
+
+						if _, ok := temperatures[town]; !ok {
+							temperatures[town] = &TemperatureInfo{
+								minimum: 100,
+								maximum: -100,
+								total:   0,
+								count:   0,
+							}
+						}
+						townTempInfo := temperatures[town]
+						townTempInfo.minimum = min(townTempInfo.minimum, temp)
+						townTempInfo.maximum = max(townTempInfo.maximum, temp)
+						townTempInfo.total += temp
+						townTempInfo.count++
+					}
+					tempInfoStream <- temperatures
+				}
+			}()
+		}
+	}()
+
+	return tempInfoStream
+}
+
+func aggregateTemperatures(tempInfoStream <-chan map[string]*TemperatureInfo) map[string]*TemperatureInfo {
+	temperatures := map[string]*TemperatureInfo{}
+
+	for tempInfo := range tempInfoStream {
+		for k, v := range tempInfo {
+			if curr, ok := temperatures[k]; ok {
+				curr.minimum = min(curr.minimum, v.minimum)
+				curr.maximum = max(curr.maximum, v.maximum)
+				curr.total += v.total
+				curr.count += v.count
+			} else {
+				temperatures[k] = v
+			}
 		}
 	}
 
-	w.Write(res)
+	return temperatures
 }
